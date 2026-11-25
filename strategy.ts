@@ -85,30 +85,37 @@ interface Params {
   triggerMult: number;
   triggerMaxAge: number;
   triggerMinRq: number;
+  /** Dip entry: buy after the coin peaked at dipPeakMult x create and then fell to dipBuyFrac x peak. */
+  useDip: boolean;
+  dipPeakMult: number;
+  dipBuyFrac: number;
+  dipMaxAge: number;
+  dipMinRq: number;
 }
 
 export const PARAMS: Params = {
-  // V1 "Launch Rider, long hold" — the least-negative shape measured on the dev window
-  // (full dev -0.86 SOL, DD 0.089; every 6h slice -0.31..-0.53, 100-132 mints, DD <=0.054).
-  // Single small buy at create price; NO adds (pyramiding into the pop dilutes the cheap
-  // entry — maxAdds 0 beat maxAdds 3 by ~1 SOL). Wide exits let the few runners run:
-  // TP +50% sells half, trailing stop -40% armed at +50%, hard stop -25%, no drain exit
-  // (the drain exit fired on the normal post-pop pullback), hold up to 20,000 slots.
-  // Dev PnL is NEGATIVE on every slice — no tested shape was positive; see kandidat-V1.md.
+  // V2 "Breakout Survivor" — buy ONLY coins that prove themselves: price >= 5x create
+  // within 600 slots, real reserve >= 10 SOL (near-graduation strength), one buy 0.30 SOL,
+  // no adds. Exit: TP +20% sells half, trailing stop -15% armed at +20%, hard stop -25%,
+  // max hold 1000 slots. Sim dev: +0.629 SOL, DD 0.033, 57 mints, win 24.4%
+  // (vs V1 launch-rider -0.859 sim / -0.804 grade-local). Dip-rider variant tested
+  // separately (useDip): best -0.072 sim — REJECTED. Trigger 1.5x/2x/3x all negative;
+  // the edge only appears at >=5x, i.e. after the early pop AND its first shakeout.
+  // Slices 6h (stake 0.30): -0.044 / +0.007 / +0.240 / +0.154 — 3/4 positive.
   maxEntryAge: 30,
   maxAddAge: 120,
-  stakeSol: 0.05,
-  chunkSol: 0.05,
+  stakeSol: 0.3,
+  chunkSol: 0.3,
   maxAdds: 0,
   minBuySol: 0.012,
   buySlipBps: 1500,
-  tp1Up: 0.5,
+  tp1Up: 0.2,
   tp1Part: 0.5,
-  trailArm: 0.5,
-  trail: 0.4,
+  trailArm: 0.2,
+  trail: 0.15,
   stopLoss: 0.25,
   drainFrac: 0,
-  maxHold: 20000,
+  maxHold: 1000,
   staleSlots: 100000,
   cooldown: 300,
   maxEntries: 1,
@@ -118,10 +125,15 @@ export const PARAMS: Params = {
   probeSol: 0.012,
   maxProbes: 1,
   maxExposureSol: 0.75,
-  useTrigger: false,
-  triggerMult: 2,
-  triggerMaxAge: 60,
-  triggerMinRq: 2,
+  useTrigger: true,
+  triggerMult: 5,
+  triggerMaxAge: 600,
+  triggerMinRq: 10,
+  useDip: false,
+  dipPeakMult: 1.5,
+  dipBuyFrac: 0.8,
+  dipMaxAge: 600,
+  dipMinRq: 0,
 };
 
 interface Tape {
@@ -129,6 +141,8 @@ interface Tape {
   creator: string | null;
   /** Price at create (virtual quote / virtual token reserves): the trigger reference. */
   createPrice: number;
+  /** Highest price seen since create (from TradeEvent virtual reserves). */
+  peakPrice: number;
   entries: number;
   lastExit: number;
   devSold: boolean;
@@ -215,7 +229,7 @@ export function createBot(p: Params = PARAMS) {
   const tapeOf = (mint: Pubkey): Tape => {
     let t = tapes.get(mint);
     if (t === undefined) {
-      t = { created: null, creator: null, createPrice: 0, entries: 0, lastExit: -1e12, devSold: false, peakRq: 0 };
+      t = { created: null, creator: null, createPrice: 0, peakPrice: 0, entries: 0, lastExit: -1e12, devSold: false, peakRq: 0 };
       tapes.set(mint, t);
     }
     return t;
@@ -250,6 +264,8 @@ export function createBot(p: Params = PARAMS) {
           traded.add(e.mint);
           const rq = Number(e.real_quote_reserves) / LAMPORTS;
           if (rq > t.peakRq) t.peakRq = rq;
+          const px = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
+          if (px > t.peakPrice) t.peakPrice = px;
           if (!e.is_buy && t.creator !== null && e.user === t.creator) t.devSold = true;
           if (t.created === null) {
             // First seen through a trade (no CreateEvent in this window): treat as newborn.
@@ -357,7 +373,7 @@ export function createBot(p: Params = PARAMS) {
       // triggerMult x its create price (and enough real SOL is in the curve). The pop is
       // then already underway, so the exit is a trailing stop from the peak, not a hold.
       for (const mint of newborn) watching.add(mint);
-      const candidates = p.useTrigger ? [...traded] : [...watching];
+      const candidates = p.useTrigger || p.useDip ? [...traded] : [...watching];
       for (const mint of candidates) {
         if (orders.length >= cap) break;
         if (slotsLeft <= 0) break;
@@ -368,7 +384,14 @@ export function createBot(p: Params = PARAMS) {
           if (!p.useTrigger) watching.delete(mint);
           continue;
         }
-        if (p.useTrigger) {
+        if (p.useDip) {
+          if (age > p.dipMaxAge) continue;
+          if (t.createPrice <= 0 || t.peakPrice < t.createPrice * p.dipPeakMult) continue;
+          const curPrice = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
+          if (curPrice > t.peakPrice * p.dipBuyFrac) continue;
+          if (curPrice < t.createPrice) continue;
+          if (Number(curve.real_quote_reserves) / LAMPORTS < p.dipMinRq) continue;
+        } else if (p.useTrigger) {
           if (age > p.triggerMaxAge) continue;
           if (t.createPrice <= 0) continue;
           const curPrice = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
